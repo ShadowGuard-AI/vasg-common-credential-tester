@@ -51,6 +51,10 @@ def _is_positive_success(response, success_marker=None):
     redirect to a location that is not the login page."""
     if success_marker and success_marker in (response.text or ""):
         return True
+    # The login test is a substring search over the whole Location
+    # value. A success page whose path or return address happens to
+    # contain the word login is read as a failed attempt, and a login
+    # page spelled any other way is read as a success.
     if response.status_code in (301, 302, 303, 307, 308):
         location = response.headers.get("Location", "")
         if location and "login" not in location.lower():
@@ -74,6 +78,10 @@ def test_credentials(url, username_field, password_field, credentials, timeout=1
         pairs = list(credentials.items())
     else:
         pairs = list(credentials)
+    # Attempts run back to back with no pause and no lockout check.
+    # Against a target that locks accounts after a few failures, the
+    # later pairs in the list may be tested against a locked account
+    # and the report cannot tell that from a wrong password.
     reached = False
     for index, (username, password) in enumerate(pairs, start=1):
         logging.info(f"Attempt {index}: username={username} password=[REDACTED]")
@@ -221,6 +229,11 @@ def main():
         credentials = DEFAULT_CREDENTIALS
 
         if args.dictionary:
+            # A readable file with no usable lines loads as an empty
+            # list, which is falsy, so it falls back to the defaults
+            # under a message saying the load failed. A file that does
+            # load replaces the defaults outright rather than adding
+            # to them.
             custom_credentials = load_credentials_from_file(args.dictionary)
             if custom_credentials:
                 credentials = custom_credentials
@@ -254,6 +267,10 @@ def main():
         script = generate_vulnerability_assessment_script(args.url, args.sqli, args.xss)
         if script:
             # Save the script to a file (e.g., vulnerability_scan.py)
+            # The generated script always lands under this fixed name
+            # in the working directory, silently overwriting a script
+            # from an earlier run, and the requests inside it carry no
+            # timeout even though the tester itself now takes one.
             script_filename = "vulnerability_scan.py"
             try:
                 with open(script_filename, "w") as f:
