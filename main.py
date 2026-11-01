@@ -1,24 +1,24 @@
 import argparse
 import requests
 import logging
-from bs4 import BeautifulSoup
 import os
 import sys
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Default username/password list
-DEFAULT_CREDENTIALS = {
-    "admin": "password",
-    "administrator": "password",
-    "admin": "admin",
-    "administrator": "admin",
-    "user": "password",
-    "user": "user",
-    "root": "password",
-    "root": "root"
-}
+# Default username/password list, as an ordered list of pairs so that
+# every written pair is tried, including repeated usernames.
+DEFAULT_CREDENTIALS = [
+    ("admin", "password"),
+    ("administrator", "password"),
+    ("admin", "admin"),
+    ("administrator", "admin"),
+    ("user", "password"),
+    ("user", "user"),
+    ("root", "password"),
+    ("root", "root"),
+]
 
 def setup_argparse():
     """
@@ -35,6 +35,9 @@ def setup_argparse():
     # Credentials file argument
     parser.add_argument("-d", "--dictionary", dest="dictionary", help="Path to a custom username/password dictionary file (username:password).", required=False)
 
+    parser.add_argument("--timeout", dest="timeout", type=float, default=10, help="Timeout in seconds for each login request (default 10).")
+    parser.add_argument("--success-marker", dest="success_marker", default=None, help="Text that must appear in a response body to count as positive evidence of a successful login. Without a marker, only a redirect to a non-login location counts as success.")
+
     # Vulnerability assessment script generation arguments
     parser.add_argument("-g", "--generate", dest="generate", action="store_true", help="Generate vulnerability assessment scripts.", required=False)
     parser.add_argument("-sqli", "--sqli", dest="sqli", action="store_true", help="Include SQL injection test in generated script.", required=False)
@@ -43,45 +46,50 @@ def setup_argparse():
     return parser.parse_args()
 
 
-def test_credentials(url, username_field, password_field, credentials):
-    """
-    Tests a list of username/password pairs against a target URL.
+def _is_positive_success(response, success_marker=None):
+    """Positive evidence only: a configured marker in the body, or a
+    redirect to a location that is not the login page."""
+    if success_marker and success_marker in (response.text or ""):
+        return True
+    if response.status_code in (301, 302, 303, 307, 308):
+        location = response.headers.get("Location", "")
+        if location and "login" not in location.lower():
+            return True
+    return False
 
-    Args:
-        url (str): The target URL of the login form.
-        username_field (str): The name of the username field.
-        password_field (str): The name of the password field.
-        credentials (dict): A dictionary of username/password pairs.
+
+def test_credentials(url, username_field, password_field, credentials, timeout=10, success_marker=None):
+    """
+    Tests username/password pairs against a target URL.
+
+    Credentials may be a list of (username, password) pairs or a dict.
+    Password values are never logged or printed.
 
     Returns:
-        bool: True if a successful login is found, False otherwise.
+        tuple: (found, reached) where found is True only on positive
+        evidence of a successful login, and reached is True when at
+        least one response was received from the target.
     """
-    try:
-        for username, password in credentials.items():
-            logging.info(f"Attempting login with username: {username} and password: {password}")
-            data = {
-                username_field: username,
-                password_field: password
-            }
-            response = requests.post(url, data=data)
-            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-
-            # Check for successful login (customize this based on the target application)
-            if "login failed" not in response.text.lower() and "incorrect" not in response.text.lower():
-                logging.info(f"Successful login with username: {username} and password: {password}")
-                return True
-            else:
-                logging.debug(f"Login failed with username: {username} and password: {password}")
-
-        logging.info("No successful login found.")
-        return False
-
-    except requests.exceptions.RequestException as e:
-        logging.error(f"An error occurred during the request: {e}")
-        return False
-    except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}")
-        return False
+    if hasattr(credentials, "items"):
+        pairs = list(credentials.items())
+    else:
+        pairs = list(credentials)
+    reached = False
+    for index, (username, password) in enumerate(pairs, start=1):
+        logging.info(f"Attempt {index}: username={username} password=[REDACTED]")
+        data = {username_field: username, password_field: password}
+        try:
+            response = requests.post(url, data=data, timeout=timeout, allow_redirects=False)
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Attempt {index}: request failed for username={username}: {e}")
+            continue
+        reached = True
+        if _is_positive_success(response, success_marker=success_marker):
+            logging.info(f"Successful login: username={username} pair_index={index} outcome=success")
+            return (True, True)
+        logging.debug(f"Attempt {index}: outcome=failed status={response.status_code}")
+    logging.info("No successful login found.")
+    return (False, reached)
 
 
 
@@ -93,19 +101,19 @@ def load_credentials_from_file(file_path):
         file_path (str): The path to the credentials file.  Each line should be in the format username:password.
 
     Returns:
-        dict: A dictionary of username/password pairs.
+        list: A list of (username, password) pairs, in file order.
     """
-    credentials = {}
+    credentials = []
     try:
         with open(file_path, "r") as f:
-            for line in f:
-                line = line.strip()
+            for lineno, raw in enumerate(f, start=1):
+                line = raw.strip()
                 if line:  # Skip empty lines
                     try:
                         username, password = line.split(":", 1)  # Split only at the first colon
-                        credentials[username.strip()] = password.strip()
+                        credentials.append((username.strip(), password.strip()))
                     except ValueError:
-                        logging.warning(f"Invalid line in credentials file: {line}.  Skipping.")
+                        logging.warning(f"Invalid line {lineno} in credentials file. Skipping.")
     except FileNotFoundError:
         logging.error(f"Credentials file not found: {file_path}")
         return None
@@ -133,13 +141,13 @@ def generate_vulnerability_assessment_script(url, sqli=False, xss=False):
         logging.warning("No vulnerability tests selected.  Script generation aborted.")
         return None
 
-    script = f"""
+    template = '''
 import requests
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-TARGET_URL = "{url}"
+TARGET_URL = __TARGET_URL__
 
 def test_url(url):
     try:
@@ -191,8 +199,9 @@ if __name__ == "__main__":
     if not test_url(TARGET_URL):
         exit(1)
 
-"""
+'''
 
+    script = template.replace("__TARGET_URL__", repr(url))
     if sqli:
         script += "    test_sqli(TARGET_URL)\n"
     if xss:
@@ -226,8 +235,12 @@ def main():
             print("No credentials available. Exiting.")
             sys.exit(1)
 
-        if test_credentials(args.url, args.username_field, args.password_field, credentials):
+        found, reached = test_credentials(args.url, args.username_field, args.password_field, credentials, timeout=args.timeout, success_marker=args.success_marker)
+        if found:
             print("Vulnerable! A common credential was successful.")
+        elif not reached:
+            print("Scan not performed: target could not be reached. No verdict issued.")
+            sys.exit(2)
         else:
             print("Not vulnerable (with the tested credentials).")
 
@@ -255,6 +268,7 @@ def main():
     else:
         print("Usage: python vasg.py -u <url> -uf <username_field> -pf <password_field> [-d <credentials_file>] OR python vasg.py -g -u <url> [-sqli] [-xss]")
         print("Please provide the required arguments.")
+        sys.exit(2)
 
 
 if __name__ == "__main__":
